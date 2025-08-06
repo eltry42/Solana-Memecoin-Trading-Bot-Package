@@ -2,8 +2,9 @@ import { VersionedTransaction, Keypair, SystemProgram, LAMPORTS_PER_SOL, Transac
 import { ASSOCIATED_TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInstruction, createSyncNativeInstruction, getAssociatedTokenAddress, getAssociatedTokenAddressSync, NATIVE_MINT, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import NodeWallet from "@coral-xyz/anchor/dist/cjs/nodewallet";
 import { AnchorProvider } from "@coral-xyz/anchor";
-import { openAsBlob } from "fs";
+import { readFile } from "fs/promises";
 import base58 from "bs58"
+import fs from 'fs';
 import { BN } from "bn.js";
 
 
@@ -13,9 +14,9 @@ import { createAndSendV0Tx, execute } from "../executor/legacy"
 import { PumpFunSDK } from "./pumpfun";
 
 import { SYSTEM_PROGRAM_ID } from "@raydium-io/raydium-sdk";
-import { getATAAddress, buyExactInInstruction, getPdaLaunchpadAuth, getPdaLaunchpadConfigId, getPdaLaunchpadPoolId, getPdaLaunchpadVaultId, TxVersion, LAUNCHPAD_PROGRAM, LaunchpadConfig } from "@raydium-io/raydium-sdk-v2";
+import { getATAAddress, buyExactInInstruction, sellExactInInstruction, getPdaLaunchpadAuth, getPdaLaunchpadConfigId, getPdaLaunchpadPoolId, getPdaLaunchpadVaultId, TxVersion, LAUNCHPAD_PROGRAM, LaunchpadConfig } from "@raydium-io/raydium-sdk-v2";
 import { initSdk } from "./config";
-import { BONK_PLATFROM_ID } from "../constants";
+import { BONK_PLATFROM_ID, CREATION_KEY } from "../constants";
 const commitment = "confirmed"
 
 const createImageMetadata = async (create) => {
@@ -73,8 +74,9 @@ let kps: Keypair[] = []
 export const createBonkFunTokenMetadata = async () => {
 
   const imageInfo = {
-    file: await openAsBlob(FILE),
+    file: new Blob([await fs.promises.readFile(FILE)], { type: "image/png" }), // or whatever MIME type your image has
   };
+  
   let imageMetadata = await createImageMetadata(imageInfo);
 
   console.log("imageMetadata: ", imageMetadata);
@@ -83,6 +85,7 @@ export const createBonkFunTokenMetadata = async () => {
     name: TOKEN_NAME,
     symbol: TOKEN_SYMBOL,
     description: DESCRIPTION,
+    twitter: TWITTER,
     createdOn: "https://bonk.fun",
     platformId: "platformId",
     image: imageMetadata
@@ -97,7 +100,7 @@ export const createBonkFunTokenMetadata = async () => {
 }
 
 // create token instructions
-export const createBonkTokenTx = async (connection: Connection, mainKp: Keypair, mintKp: Keypair) => {
+export const createBonkTokenTx = async (connection: Connection, creatorKp: Keypair, mintKp: Keypair) => {
   try {
 
     const uri = await createBonkFunTokenMetadata();
@@ -107,7 +110,7 @@ export const createBonkTokenTx = async (connection: Connection, mainKp: Keypair,
     }
 
     // Initialize SDK
-    const raydium = await initSdk(mainKp.publicKey);
+    const raydium = await initSdk(creatorKp.publicKey)
 
     // Get config info
     const configId = getPdaLaunchpadConfigId(LAUNCHPAD_PROGRAM, NATIVE_MINT, 0, 0).publicKey;
@@ -121,7 +124,7 @@ export const createBonkTokenTx = async (connection: Connection, mainKp: Keypair,
     const mintBInfo = await raydium.token.getTokenInfo(configInfo.mintB);
 
     // Set up transaction parameters
-    const solBuyAmount = 0.01;
+    const solBuyAmount = 0.0151;
     const buyAmount = new BN(solBuyAmount * 10 ** 9);
     const slippageAmount = 0.1;
     const slippage = new BN(slippageAmount * 100);
@@ -142,7 +145,7 @@ export const createBonkTokenTx = async (connection: Connection, mainKp: Keypair,
       platformId: BONK_PLATFROM_ID,
       txVersion: TxVersion.LEGACY,
       buyAmount,
-      feePayer: mainKp.publicKey,
+      feePayer: creatorKp.publicKey,
       createOnly: true,
       extraSigners: [mintKp],
       computeBudgetConfig: {
@@ -165,7 +168,7 @@ export const createBonkTokenTx = async (connection: Connection, mainKp: Keypair,
     ];
     const jitoFeeWallet = new PublicKey(tipAccounts[Math.floor(tipAccounts.length * Math.random())])
     console.log(`Selected Jito fee wallet: ${jitoFeeWallet.toBase58()}`);
-    console.log(`Calculated fee: ${JITO_FEE * LAMPORTS_PER_SOL} SOL`);
+    console.log(`Calculated fee: ${JITO_FEE} SOL`);
 
     // Get latest blockhash
     const latestBlockhash = await connection.getLatestBlockhash();
@@ -175,19 +178,19 @@ export const createBonkTokenTx = async (connection: Connection, mainKp: Keypair,
     const ixs = transactions[0].instructions
     ixs.push(
       SystemProgram.transfer({
-        fromPubkey: mainKp.publicKey,
+        fromPubkey: creatorKp.publicKey,
         toPubkey: jitoFeeWallet,
         lamports: Math.floor(JITO_FEE * 10 ** 9),
       }),
     )
     const messageV0 = new TransactionMessage({
-      payerKey: mainKp.publicKey,
+      payerKey: creatorKp.publicKey,
       recentBlockhash: blockhash,
       instructions: ixs
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([mainKp, mintKp]);
+    transaction.sign([creatorKp, mintKp]);
 
     console.log("create token transaction simulate ==>", await connection.simulateTransaction(transaction, { sigVerify: true }))
 
@@ -208,7 +211,7 @@ export const createTokenTx = async (mainKp: Keypair, mintKp: Keypair) => {
     twitter: TWITTER,
     telegram: TELEGRAM,
     website: WEBSITE,
-    file: await openAsBlob(FILE),
+    file: new Blob([await fs.promises.readFile(FILE)], { type: "image/png" }), // or whatever MIME type your image has
   };
   let tokenMetadata = await sdk.createTokenMetadata(tokenInfo);
 
@@ -243,78 +246,90 @@ export const createTokenTx = async (mainKp: Keypair, mintKp: Keypair) => {
   ]
 }
 
-export const distributeSol = async (connection: Connection, mainKp: Keypair, distritbutionNum: number) => {
+export const distributeSol = async (connection: Connection, mainKp: Keypair, distributionNum: number) => {
   try {
-    const sendSolTx: TransactionInstruction[] = []
-    sendSolTx.push(
+    const computeIxs: TransactionInstruction[] = [
       ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
-      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 250_000 })
-    )
-    const mainSolBal = await connection.getBalance(mainKp.publicKey)
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 250_000 }),
+    ];
+
+    const mainSolBal = await connection.getBalance(mainKp.publicKey);
     if (mainSolBal <= 4 * 10 ** 6) {
-      console.log("Main wallet balance is not enough")
-      return []
+      console.log("Main wallet balance is not enough");
+      return [];
     }
-    let solAmount = Math.floor((SWAP_AMOUNT + 0.01) * 10 ** 9)
 
-    for (let i = 0; i < distritbutionNum; i++) {
+    //TODO: CHANGE RANDOM EXTRA HERE 
+    const randomExtra = 0.01 + Math.random() * (0.005 - 0.001);
 
-      const wallet = Keypair.generate()
-      kps.push(wallet)
+    const intermediaryWallets: Keypair[] = [];
+    const buyerWallets: Keypair[] = [];
+    const instructions: TransactionInstruction[] = [...computeIxs];
+    const allSigners: Keypair[] = [mainKp];
 
-      sendSolTx.push(
+    // Step 1: Create instructions
+    for (let i = 0; i < distributionNum; i++) {
+      const intermediary = Keypair.generate();
+      const buyer = Keypair.generate();
+
+      intermediaryWallets.push(intermediary);
+      buyerWallets.push(buyer);
+      allSigners.push(intermediary); // Sign needed for intermediary → buyer
+      const solAmount = Math.floor((SWAP_AMOUNT + randomExtra) * 1e9); 
+
+      // main → intermediary
+      instructions.push(
         SystemProgram.transfer({
           fromPubkey: mainKp.publicKey,
-          toPubkey: wallet.publicKey,
-          lamports: solAmount
+          toPubkey: intermediary.publicKey,
+          lamports: solAmount,
         })
-      )
+      );
+
+      // intermediary → buyer
+      instructions.push(
+        SystemProgram.transfer({
+          fromPubkey: intermediary.publicKey,
+          toPubkey: buyer.publicKey,
+          lamports: solAmount,
+        })
+      );
     }
 
+    // Step 2: Bundle and send
+    const latestBlockhash = await connection.getLatestBlockhash();
+    const messageV0 = new TransactionMessage({
+      payerKey: mainKp.publicKey,
+      recentBlockhash: latestBlockhash.blockhash,
+      instructions,
+    }).compileToV0Message();
+
+    const transaction = new VersionedTransaction(messageV0);
+    transaction.sign(allSigners); // All necessary keypairs
+
+    const txSig = await execute(transaction, latestBlockhash, 1);
+    if (txSig) {
+      console.log("Bundled SOL distribution: https://solscan.io/tx/" + txSig);
+    } else {
+      throw new Error("Transaction failed");
+    }
+
+    // Step 3: Save buyer wallets
     try {
-      saveDataToFile(kps.map(kp => base58.encode(kp.secretKey)))
+      saveDataToFile(
+        [...intermediaryWallets, ...buyerWallets].map(kp => base58.encode(kp.secretKey))
+      );
     } catch (error) {
-
+      console.log("Error saving buyer wallets:", error);
     }
 
-    let index = 0
-    while (true) {
-      try {
-        if (index > 5) {
-          console.log("Error in distribution")
-          return null
-        }
-        const siTx = new Transaction().add(...sendSolTx)
-        const latestBlockhash = await connection.getLatestBlockhash()
-        siTx.feePayer = mainKp.publicKey
-        siTx.recentBlockhash = latestBlockhash.blockhash
-        const messageV0 = new TransactionMessage({
-          payerKey: mainKp.publicKey,
-          recentBlockhash: latestBlockhash.blockhash,
-          instructions: sendSolTx,
-        }).compileToV0Message()
-        const transaction = new VersionedTransaction(messageV0)
-        transaction.sign([mainKp])
-        // console.log(await connection.simulateTransaction(transaction))
-        let txSig = await execute(transaction, latestBlockhash, 1)
-
-        if (txSig) {
-          const distibuteTx = txSig ? `https://solscan.io/tx/${txSig}` : ''
-          console.log("SOL distributed ", distibuteTx)
-          break
-        }
-        index++
-      } catch (error) {
-        index++
-      }
-    }
-    console.log("Success in distribution")
-    return kps
+    return buyerWallets;
   } catch (error) {
-    console.log(`Failed to transfer SOL`, error)
-    return null
+    console.log("Failed to transfer SOL:", error);
+    return null;
   }
-}
+};
+
 
 export const createLUT = async (mainKp: Keypair) => {
   let i = 0
@@ -639,4 +654,3 @@ export const makeBuyIx = async (kp: Keypair, buyAmount: number, index: number, c
 
   return buyInstruction
 }
-

@@ -1,10 +1,13 @@
 import { VersionedTransaction, Keypair, Connection, ComputeBudgetProgram, TransactionInstruction, TransactionMessage, PublicKey } from "@solana/web3.js"
 import base58 from "bs58"
-import { DISTRIBUTION_WALLETNUM, PRIVATE_KEY, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, SWAP_AMOUNT, VANITY_MODE } from "./constants"
-import { generateVanityAddress, saveDataToFile, sleep } from "./utils"
+import { DISTRIBUTION_WALLETNUM, PRIVATE_KEY, RPC_ENDPOINT, RPC_WEBSOCKET_ENDPOINT, SWAP_AMOUNT, BUYER_AMOUNT, VANITY_MODE, CREATION_KEY, VOL_BOT_TIMEOUT } from "./constants"
+import { generateVanityAddress, saveDataToFile, sleep, readJson } from "./utils"
 import { distributeSol, addBonkAddressesToTable, createLUT, makeBuyIx, createBonkFunTokenMetadata, createBonkTokenTx, createTokenTx } from "./src/main";
 import { executeJitoTx } from "./executor/jito";
-
+import { SellFromWallet } from "./sell_indv";
+import fs from "fs";
+import path from "path";
+import { spawn } from "child_process";
 
 
 const commitment = "confirmed"
@@ -13,10 +16,12 @@ const connection = new Connection(RPC_ENDPOINT, {
   wsEndpoint: RPC_WEBSOCKET_ENDPOINT, commitment
 })
 const mainKp = Keypair.fromSecretKey(base58.decode(PRIVATE_KEY))
+const creatorKp = Keypair.fromSecretKey(base58.decode(CREATION_KEY))
 console.log(mainKp.publicKey.toBase58())
 
 let kps: Keypair[] = []
 const transactions: VersionedTransaction[] = []
+const creator_transactions: VersionedTransaction[] = []
 
 let mintKp = Keypair.generate()
 console.log("mintKp", mintKp.publicKey.toString());
@@ -39,7 +44,7 @@ const main = async () => {
 
   console.log("Mint address of token ", mintAddress.toBase58())
   saveDataToFile([base58.encode(mintKp.secretKey)], "mint.json")
-
+  saveDataToFile([mintKp.publicKey.toBase58()], "pub_mint.json")
 
   const minimumSolAmount = (SWAP_AMOUNT + 0.01) * DISTRIBUTION_WALLETNUM + 0.05
 
@@ -69,11 +74,10 @@ const main = async () => {
   saveDataToFile([lutAddress.toBase58()], "lut.json")
   await addBonkAddressesToTable(lutAddress, mintAddress, kps, mainKp)
 
-
   const buyIxs: TransactionInstruction[] = []
 
   for (let i = 0; i < DISTRIBUTION_WALLETNUM; i++) {
-    const ix = await makeBuyIx(kps[i], Math.floor(SWAP_AMOUNT * 10 ** 9), i, mainKp.publicKey, mintKp.publicKey /*new PublicKey("Y9YW5uaPfFtQuwbe6z9namDn8S1JoTHAD29j7opbonk")*/)
+    const ix = await makeBuyIx(kps[i], Math.floor(SWAP_AMOUNT * 10 ** 9), i, creatorKp.publicKey, mintKp.publicKey /*new PublicKey("Y9YW5uaPfFtQuwbe6z9namDn8S1JoTHAD29j7opbonk")*/)
     buyIxs.push(...ix)
   }
 
@@ -88,14 +92,14 @@ const main = async () => {
   console.log("Lookup table is ready, address:", lookupTable.key.toBase58())
 
 
-  const tokenCreationTx = await createBonkTokenTx(connection, mainKp, mintKp)
+  const tokenCreationTx = await createBonkTokenTx(connection, creatorKp, mintKp)
 
   console.log("Token creation transaction created, size:", tokenCreationTx.serialize().length, "bytes")
 
   transactions.push(tokenCreationTx)
+  const latestBlockhash = await connection.getLatestBlockhash()
   console.log("Executing token creation transaction...")
   for (let i = 0; i < Math.ceil(DISTRIBUTION_WALLETNUM / 5); i++) {
-    const latestBlockhash = await connection.getLatestBlockhash()
     if (!latestBlockhash) {
       console.log("Failed to get latest blockhash")
       return
@@ -146,9 +150,99 @@ const main = async () => {
   console.log("Buy transactions created, total size:", transactions.reduce((acc, tx) => acc + tx.serialize().length, 0), "bytes")
 
   transactions.map(async (tx, i) => console.log(i, " | ", tx.serialize().length, "bytes | \n", (await connection.simulateTransaction(tx, { sigVerify: true }))))
+
+  // // === Creator Buy and Sell BEFORE public buyers ===
+  console.log("Creating creator buy INSTRUCTIONS...")
+  const creatorBuyIx = await makeBuyIx(creatorKp, Math.floor(BUYER_AMOUNT * 10 ** 9), 0, creatorKp.publicKey, mintAddress)
+
+  if (!creatorBuyIx) {
+    console.log("Creator buy transaction failed or skipped")
+    return;
+  }
+
+  const creatorInstructions: TransactionInstruction[] = [
+    ComputeBudgetProgram.setComputeUnitLimit({ units: 1_000_000 }),
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 200_000 }),
+    ...creatorBuyIx,
+  ];
+
+  const creatorBlockhash = latestBlockhash;
+
+  const creatorMessage = new TransactionMessage({
+    payerKey: creatorKp.publicKey,
+    recentBlockhash: creatorBlockhash.blockhash,
+    instructions: creatorInstructions
+  }).compileToV0Message(/* optionally pass [lookupTable] */);
+
+  const creatorTx = new VersionedTransaction(creatorMessage);
+  creatorTx.sign([creatorKp]);
+  transactions.push(creatorTx);
+
+  console.log("✅ Creator buy transaction created and signed.");
+
   console.log("Executing transactions...")
   await executeJitoTx(transactions, mainKp, commitment)
-  await sleep(10000)
+  await sleep(10 * 1000)
+
+  console.log("Gathering and selling tokens from creator...")
+  await SellFromWallet(connection, creatorKp)
+
+  vol_trading()
 }
 
 main()
+
+const vol_trading = async () => {
+  console.log("VOLUME TRADING IN PROGRESS...");
+
+  const botFolderPath = path.resolve(__dirname, "../raydium-volume-bot-latest");
+  const envPath = path.join(botFolderPath, ".env");
+
+  // Step 1: Load current .env content
+  let envLines: string[] = [];
+  if (fs.existsSync(envPath)) {
+    envLines = fs.readFileSync(envPath, "utf8").split("\n");
+  }
+
+  // Step 2: Read mint address
+  const token_cas = readJson("pub_mint.json");
+  const token_ca = token_cas[token_cas.length - 1];
+
+  // Step 3: Update TOKEN_MINT line in-place
+  let found = false;
+  envLines = envLines.map((line) => {
+    if (line.startsWith("TOKEN_MINT=")) {
+      found = true;
+      return `TOKEN_MINT=${token_ca}`;
+    }
+    return line;
+  });
+
+  if (!found) {
+    envLines.push(`TOKEN_MINT=${token_ca}`);
+  }
+
+  // Step 4: Write back the updated .env
+  fs.writeFileSync(envPath, envLines.join("\n"), "utf8");
+  console.log("✅ Updated .env with mint:", token_ca);
+
+  // Step 5: Run the bot's index.ts using ts-node
+  console.log("🚀 Launching Raydium volume bot...");
+  const botProcess = spawn("npx", ["ts-node", "index.ts"], {
+    cwd: botFolderPath,
+    stdio: "inherit",
+    shell: true,
+  });
+
+  setTimeout(() => {
+    console.log("⏰ 10 minutes passed. Terminating the volume bot...");
+    botProcess.kill(); // Sends SIGTERM by default
+  }, VOL_BOT_TIMEOUT);
+
+  botProcess.on("close", (code) => {
+    console.log(`📦 Volume bot process exited with code ${code}`);
+  });
+}
+
+//for testing function 
+// vol_trading()

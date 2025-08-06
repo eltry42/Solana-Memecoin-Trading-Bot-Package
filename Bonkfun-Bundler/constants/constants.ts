@@ -2,6 +2,7 @@ import { retrieveEnvVariable } from "../utils"
 import { PublicKey } from "@solana/web3.js";
 
 export const PRIVATE_KEY = retrieveEnvVariable('PRIVATE_KEY')
+export const CREATION_KEY = retrieveEnvVariable('CREATION_KEY')
 export const RPC_ENDPOINT = retrieveEnvVariable('RPC_ENDPOINT')
 export const RPC_WEBSOCKET_ENDPOINT = retrieveEnvVariable('RPC_WEBSOCKET_ENDPOINT')
 
@@ -15,6 +16,7 @@ export const TELEGRAM = retrieveEnvVariable('TELEGRAM')
 export const WEBSITE = retrieveEnvVariable('WEBSITE')
 export const FILE = retrieveEnvVariable('FILE')
 export const VANITY_MODE = retrieveEnvVariable('VANITY_MODE') == "true"
+export const VOL_BOT_TIMEOUT = Number(retrieveEnvVariable('VOL_BOT_TIMEOUT'))
 
 export const SWAP_AMOUNT = Number(retrieveEnvVariable('SWAP_AMOUNT'))
 export const DISTRIBUTION_WALLETNUM = Number(retrieveEnvVariable('DISTRIBUTION_WALLETNUM'))
